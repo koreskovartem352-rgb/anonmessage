@@ -28,13 +28,20 @@ dp.include_router(router)
 # Хранилища
 reply_storage = {}  
 blocked_users = {}  
-user_stats = {} # {user_id: {'t_msg': 0, 'all_msg': 0, 't_view': 0, 'all_view': 0, 'date': 'iso'}}
+user_stats = {} 
+prank_storage = {} # {msg_id: fake_author_name}
 
 class AnonState(StatesGroup):
     waiting_for_message = State()
     recipient_id = State()
     prompt_msg_id = State() 
     waiting_for_mod_id = State()
+
+# Новые состояния для шалости
+class PrankState(StatesGroup):
+    target_id = State()
+    fake_author = State()
+    message_text = State()
 
 # --- ШАБЛОНЫ ТЕКСТОВ ---
 
@@ -51,7 +58,6 @@ def get_cancel_kb():
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Отменить ❌", callback_data="cancel_send")]])
 
 def check_stats_reset(user_id):
-    """Сбрасывает дневную статистику, если наступил новый день"""
     today = datetime.now().date().isoformat()
     if user_id not in user_stats:
         user_stats[user_id] = {'t_msg': 0, 'all_msg': 0, 't_view': 0, 'all_view': 0, 'date': today}
@@ -84,43 +90,110 @@ async def get_start_info(user_id: int):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Поделиться ссылкой 🔗", url=share_url)]])
     return text, kb
 
-def get_msg_inline_kb(sender_id: int, recipient_id: int, is_blocked: bool = False, is_revealed: bool = False):
+def get_msg_inline_kb(sender_id: int, recipient_id: int, is_blocked: bool = False, is_revealed: bool = False, is_prank: bool = False):
     btns = []
-    b_text = "Разблокировать ✅" if is_blocked else "Заблокировать 🚫"
-    btns.append([InlineKeyboardButton(text=b_text, callback_data=f"{'un' if is_blocked else ''}block_{sender_id}")])
-    if recipient_id in moderators:
-        r_text = "Скрыть автора 🙈" if is_revealed else "Раскрыть автора 👁"
-        btns.append([InlineKeyboardButton(text=r_text, callback_data=f"{'hide' if is_revealed else 'reveal'}_{sender_id}")])
+    # Если это шалость, кнопка блока не нужна или должна вести в никуда
+    if not is_prank:
+        b_text = "Разблокировать ✅" if is_blocked else "Заблокировать 🚫"
+        btns.append([InlineKeyboardButton(text=b_text, callback_data=f"{'un' if is_blocked else ''}block_{sender_id}")])
+    
+    # Кнопка раскрытия автора
+    prefix = "prankreveal" if is_prank else "reveal"
+    hide_prefix = "prankhide" if is_prank else "hide"
+    
+    r_text = "Скрыть автора 🙈" if is_revealed else "Раскрыть автора 👁"
+    call_data = f"{hide_prefix if is_revealed else prefix}_{sender_id}"
+    btns.append([InlineKeyboardButton(text=r_text, callback_data=call_data)])
+    
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
-# --- СТАТИСТИКА (ИСПРАВЛЕНА) ---
+# --- АДМИН ПАНЕЛЬ: ШАЛОСТЬ ---
 
-@router.message(Command("stats"))
-@router.message(F.text == "Статистика")
-async def show_stats(message: Message):
-    uid = message.from_user.id
-    check_stats_reset(uid)
-    s = user_stats[uid]
-    bot_info = await bot.get_me()
-    link = f"t.me/{bot_info.username}?start={encode_payload(uid)}"
+@router.message(F.text == "🎉 Шалость", F.from_user.id == SUPER_ADMIN_ID)
+async def prank_step_1(message: Message, state: FSMContext):
+    await state.set_state(PrankState.target_id)
+    await message.answer("👤 Шалость активирована!\nВведи ID пользователя, которому отправим сообщение:")
+
+@router.message(PrankState.target_id, F.from_user.id == SUPER_ADMIN_ID)
+async def prank_step_2(message: Message, state: FSMContext):
+    try:
+        target_id = int(message.text)
+        await state.update_data(target_id=target_id)
+        await state.set_state(PrankState.fake_author)
+        await message.answer("🎭 От кого будет это сообщение?\nВведи имя или юзернейм (например: @durov или 'Тайный Поклонник'):")
+    except:
+        await message.answer("❌ Нужно ввести числовой ID пользователя.")
+
+@router.message(PrankState.fake_author, F.from_user.id == SUPER_ADMIN_ID)
+async def prank_step_3(message: Message, state: FSMContext):
+    await state.update_data(fake_author=message.text)
+    await state.set_state(PrankState.message_text)
+    await message.answer("💬 Теперь введи текст сообщения:")
+
+@router.message(PrankState.message_text, F.from_user.id == SUPER_ADMIN_ID)
+async def prank_final(message: Message, state: FSMContext):
+    data = await state.get_data()
+    tid = data['target_id']
+    fake_name = data['fake_author']
+    text = message.text
     
-    text = (
-        "📌 Статистика профиля\n\n"
-        "➖ Сегодня:\n"
-        f"💬 Сообщений: {s['t_msg']}\n"
-        f"👀 Переходов по ссылке: {s['t_view']}\n"
-        "⭐️ Популярность: 1000+ место\n\n"
-        "➖ За всё время:\n"
-        f"💬 Сообщений: {s['all_msg']}\n"
-        f"👀 Переходов по ссылке: {s['all_view']}\n"
-        "⭐️ Популярность: 1000+ место\n\n"
-        "Чтобы поднять ⭐️ уровень популярности, распространяйте свою персональную ссылку:\n"
-        f"👉 {link}"
-    )
-    _, kb = await get_start_info(uid)
-    await message.answer(text, reply_markup=kb, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    h = "✨ У тебя новое анонимное сообщение!"
+    f = "↩️ Свайпни для ответа."
+    # Используем SUPER_ADMIN_ID как временный заглушечный ID отправителя
+    kb = get_msg_inline_kb(SUPER_ADMIN_ID, tid, is_prank=True)
+    
+    try:
+        sent = await bot.send_message(tid, f"{h}\n\n{html.escape(text)}\n\n{f}", reply_markup=kb, parse_mode="HTML")
+        # Сохраняем фейковое имя для этого сообщения
+        prank_storage[sent.message_id] = fake_name
+        await message.answer("✅ Шалость успешно отправлена!")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при отправке: {e}")
+    
+    await state.clear()
 
-# --- ОСНОВНЫЕ ХЕНДЛЕРЫ ---
+# --- ИЗМЕНЕННЫЙ ОБРАБОТЧИК РАСКРЫТИЯ ---
+
+@router.callback_query(F.data.startswith(("reveal_", "hide_", "prankreveal_", "prankhide_")))
+async def toggle_reveal(callback: CallbackQuery):
+    data = callback.data
+    is_prank = "prank" in data
+    action = "reveal" if "reveal" in data else "hide"
+    
+    # Извлекаем ID (для шалости он формальный)
+    parts = data.split("_")
+    sender_id = int(parts[1])
+    is_revealed = (action == "reveal")
+    
+    if is_prank:
+        # Берем имя из нашего спец. хранилища
+        auth = prank_storage.get(callback.message.message_id, "Неизвестный шутник")
+    else:
+        # Стандартная логика раскрытия реального юзера
+        user_info = await bot.get_chat(sender_id)
+        if user_info.username: auth = f"@{user_info.username}"
+        else: auth = f'<a href="tg://user?id={sender_id}">{html.escape(user_info.first_name)}</a>'
+    
+    cur_text = callback.message.text or callback.message.caption or ""
+    header = "✨ У тебя новое анонимное сообщение!"
+    footer = "↩️ Свайпни для ответа."
+    
+    clean = cur_text.replace(header, "").replace(footer, "").strip()
+    if "👤 Автор:" in clean:
+        clean = clean.split("👤 Автор:")[0].strip()
+
+    final_text = f"{header}\n\n{clean}\n\n👤 Автор: {auth}\n\n{footer}" if is_revealed else f"{header}\n\n{clean}\n\n{footer}"
+    new_kb = get_msg_inline_kb(sender_id, callback.from_user.id, is_revealed=is_revealed, is_prank=is_prank)
+
+    try:
+        if callback.message.text:
+            await callback.message.edit_text(final_text, reply_markup=new_kb, parse_mode="HTML")
+        else:
+            await callback.message.edit_caption(caption=final_text, reply_markup=new_kb, parse_mode="HTML")
+    except: pass
+    await callback.answer()
+
+# --- ОСТАЛЬНЫЕ ХЕНДЛЕРЫ (БЕЗ ИЗМЕНЕНИЙ, КРОМЕ АДМИНКИ) ---
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
@@ -132,17 +205,18 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         text, kb = await get_start_info(user_id)
         await message.answer(text, reply_markup=kb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
         if user_id == SUPER_ADMIN_ID:
-            adm_kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="➕ Добавить модератора"), KeyboardButton(text="➖ Убрать модератора")], [KeyboardButton(text="📋 Список модераторов")]], resize_keyboard=True)
+            adm_kb = ReplyKeyboardMarkup(keyboard=[
+                [KeyboardButton(text="➕ Добавить модератора"), KeyboardButton(text="➖ Убрать модератора")],
+                [KeyboardButton(text="📋 Список модераторов"), KeyboardButton(text="🎉 Шалость")]
+            ], resize_keyboard=True)
             await message.answer("Админ-панель активирована", reply_markup=adm_kb)
         return
 
     recipient_id = decode_payload(payload)
     if recipient_id:
-        # СЧИТАЕМ ПЕРЕХОД
         check_stats_reset(recipient_id)
         user_stats[recipient_id]['t_view'] += 1
         user_stats[recipient_id]['all_view'] += 1
-        
         await state.update_data(recipient_id=recipient_id)
         await state.set_state(AnonState.waiting_for_message)
         p = await message.answer(INSTRUCTION, reply_markup=get_cancel_kb())
@@ -162,7 +236,6 @@ async def process_anon_message(message: Message, state: FSMContext):
 
     if not is_blocked:
         try:
-            # СЧИТАЕМ ПРИШЕДШЕЕ СООБЩЕНИЕ
             check_stats_reset(rid)
             user_stats[rid]['t_msg'] += 1
             user_stats[rid]['all_msg'] += 1
@@ -192,31 +265,23 @@ async def process_anon_message(message: Message, state: FSMContext):
     txt, mkb = await get_start_info(sid)
     await message.answer(txt, reply_markup=mkb, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-@router.callback_query(F.data.startswith(("reveal_", "hide_")))
-async def toggle_reveal(callback: CallbackQuery):
-    action, sender_id_str = callback.data.split("_")
-    sender_id = int(sender_id_str)
-    is_revealed = (action == "reveal")
-    user_info = await bot.get_chat(sender_id)
-    if user_info.username: auth = f"@{user_info.username}"
-    else: auth = f'<a href="tg://user?id={sender_id}">{html.escape(user_info.first_name)}</a>'
-    
-    cur_text = callback.message.text or callback.message.caption or ""
-    header = "✨ У тебя новое анонимное сообщение!"
-    footer = "↩️ Свайпни для ответа."
-    
-    clean = cur_text.replace(header, "").replace(footer, "").strip()
-    if "👤 Автор:" in clean:
-        clean = clean.split("👤 Автор:")[0].strip()
-
-    final_text = f"{header}\n\n{clean}\n\n👤 Автор: {auth}\n\n{footer}" if is_revealed else f"{header}\n\n{clean}\n\n{footer}"
-    new_kb = get_msg_inline_kb(sender_id, callback.from_user.id, is_revealed=is_revealed)
-
-    if callback.message.text:
-        await callback.message.edit_text(final_text, reply_markup=new_kb, parse_mode="HTML")
-    else:
-        await callback.message.edit_caption(caption=final_text, reply_markup=new_kb, parse_mode="HTML")
-    await callback.answer()
+@router.message(Command("stats"))
+@router.message(F.text == "Статистика")
+async def show_stats(message: Message):
+    uid = message.from_user.id
+    check_stats_reset(uid)
+    s = user_stats[uid]
+    bot_info = await bot.get_me()
+    link = f"t.me/{bot_info.username}?start={encode_payload(uid)}"
+    text = (
+        "📌 Статистика профиля\n\n➖ Сегодня:\n"
+        f"💬 Сообщений: {s['t_msg']}\n👀 Переходов по ссылке: {s['t_view']}\n⭐️ Популярность: 1000+ место\n\n"
+        "➖ За всё время:\n"
+        f"💬 Сообщений: {s['all_msg']}\n👀 Переходов по ссылке: {s['all_view']}\n⭐️ Популярность: 1000+ место\n\n"
+        f"Чтобы поднять ⭐️ уровень популярности, распространяйте свою персональную ссылку:\n👉 {link}"
+    )
+    _, kb = await get_start_info(uid)
+    await message.answer(text, reply_markup=kb, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 @router.callback_query(F.data.startswith("write_more_"))
 async def write_more(callback: CallbackQuery, state: FSMContext):
@@ -286,8 +351,7 @@ async def adm_proc(message: Message, state: FSMContext):
 async def main():
     await bot.set_my_commands([
         BotCommand(command="start", description="Запустить"),
-        BotCommand(command="stats", description="Статистика"),
-        BotCommand(command="idea", description="Предложить идею")
+        BotCommand(command="stats", description="Статистика")
     ])
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
